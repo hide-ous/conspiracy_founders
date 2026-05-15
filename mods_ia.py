@@ -4,55 +4,58 @@ Internet Archive Moderator History Scraper
 Fetches moderator lists from Internet Archive (Wayback Machine) snapshots.
 
 Usage:
-    python archive_scraper.py <subreddit> [<subreddit> ...]
-    python archive_scraper.py --file subreddits.txt
-    python archive_scraper.py pics gaming --output results.json
+    python archive_scraper.py --output results.json
 
 Requirements:
-    pip install aiohttp aiofiles tqdm
+    pip install aiohttp python-dotenv
 """
 
 import argparse
 import asyncio
+import csv
 import json
 import logging
+import os
 import re
 import sys
-import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
+from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
+
+# Load environment variables
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 # Internet Archive CDX API
-IA_CDX_BASE         = "https://web.archive.org/cdx/search/cdx"
-IA_WAYBACK_BASE     = "https://web.archive.org/web"
-IA_CONCURRENCY      = 8            # parallel IA fetches (generous, IA allows it)
-IA_TIMEOUT          = 30
-IA_MAX_RETRIES      = 3
-IA_RETRY_SLEEP      = 2.0
+IA_CDX_BASE = "https://web.archive.org/cdx/search/cdx"
+IA_WAYBACK_BASE = "https://web.archive.org/web"
+IA_CONCURRENCY = 8
+IA_TIMEOUT = 30
+IA_MAX_RETRIES = 3
+IA_RETRY_SLEEP = 2.0
 
-USER_AGENT = (
-    "ModHistoryScraper/1.0 (research tool; "
-    "https://github.com/example/mod-history; contact@example.com)"
-)
+USER_AGENT = os.getenv("USER_AGENT")
+if not USER_AGENT:
+    print("Error: USER_AGENT not found in .env file", file=sys.stderr)
+    sys.exit(1)
 
 # IA URL templates to snapshot-search
 IA_URL_TEMPLATES = [
-    "https://www.reddit.com/r/{sub}",
-    "https://old.reddit.com/r/{sub}",
-    "https://old.reddit.com/r/{sub}/about/moderators/.json",
     "https://old.reddit.com/r/{sub}/about/moderators",
-    "https://www.reddit.com/mod/{sub}/moderators",
+    "https://old.reddit.com/r/{sub}/about/moderators/.json",
     "https://www.reddit.com/r/{sub}/about/moderators",
 ]
+
+# Early stopping: 7 days in seconds
+EARLY_STOP_THRESHOLD = 7 * 24 * 60 * 60
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,19 +70,28 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @dataclass
+class SubredditInfo:
+    name: str
+    creation_date: int
+    earliest_post: int
+    earliest_comment: int
+
+
+@dataclass
 class ModEntry:
     username: str
-    added_utc: Optional[int]        # Unix timestamp if known, else None
-    added_date: Optional[str]       # ISO-8601 string
+    added_utc: Optional[int]
+    added_date: Optional[str]
     permissions: list[str] = field(default_factory=list)
-    source: str = "unknown"         # "ia_json" | "ia_html"
+    source: str = "unknown"
     snapshot_url: Optional[str] = None
+    snapshot_timestamp: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @staticmethod
-    def from_reddit_json(entry: dict, source: str = "ia_json") -> "ModEntry":
+    def from_reddit_json(entry: dict, source: str, snapshot_url: str, snapshot_ts: str) -> "ModEntry":
         ts = entry.get("date")
         return ModEntry(
             username=entry.get("name", ""),
@@ -87,15 +99,20 @@ class ModEntry:
             added_date=datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None,
             permissions=entry.get("mod_permissions", []),
             source=source,
+            snapshot_url=snapshot_url,
+            snapshot_timestamp=snapshot_ts,
         )
 
 
 @dataclass
 class SubredditResult:
     subreddit: str
+    creation_date: int
     fetched_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     moderators: list[ModEntry] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    stopped_early: bool = False
+    early_stop_reason: Optional[str] = None
 
     def merge(self, other_mods: list[ModEntry]) -> None:
         """Add mods not already present (keyed by username, prefer entries with dates)."""
@@ -105,16 +122,31 @@ class SubredditResult:
             if key not in existing:
                 existing[key] = m
             elif m.added_utc and not existing[key].added_utc:
-                existing[key] = m          # upgrade: now has a date
+                existing[key] = m
         self.moderators = sorted(existing.values(), key=lambda x: x.added_utc or 0)
+
+    def check_early_stop(self) -> bool:
+        """Check if we found a mod within 7 days of subreddit creation."""
+        for mod in self.moderators:
+            if mod.added_utc:
+                days_diff = (mod.added_utc - self.creation_date) / (24 * 60 * 60)
+                if mod.added_utc <= self.creation_date or days_diff <= 7:
+                    self.stopped_early = True
+                    self.early_stop_reason = f"Found {mod.username} added within 7 days of creation (diff: {days_diff:.1f} days)"
+                    return True
+        return False
 
     def to_dict(self) -> dict:
         return {
             "subreddit": self.subreddit,
+            "creation_date": self.creation_date,
+            "creation_date_iso": datetime.fromtimestamp(self.creation_date, tz=timezone.utc).isoformat(),
             "fetched_at": self.fetched_at,
             "moderator_count": len(self.moderators),
             "moderators": [m.to_dict() for m in self.moderators],
             "errors": self.errors,
+            "stopped_early": self.stopped_early,
+            "early_stop_reason": self.early_stop_reason,
         }
 
 
@@ -122,98 +154,177 @@ class SubredditResult:
 # Internet Archive helpers
 # ---------------------------------------------------------------------------
 
-async def ia_cdx_snapshots(
-    session: aiohttp.ClientSession,
-    url: str,
-    *,
-    limit: int = 50,
-    from_date: str = "20050101",
-    to_date: Optional[str] = None,
+async def ia_cdx_snapshots_by_year(
+        session: aiohttp.ClientSession,
+        url: str,
+        from_year: int = 2005,
+        to_year: Optional[int] = None,
 ) -> list[dict]:
     """
-    Query the CDX API for archived snapshots of `url`.
+    Query CDX API for one snapshot per year.
     Returns a list of {timestamp, original, statuscode, mimetype} dicts.
     """
-    params = {
-        "output": "json",
-        "url": url,
-        "fl": "timestamp,original,statuscode,mimetype",
-        "filter": "statuscode:200",
-        "collapse": "timestamp:8",   # one snapshot per day
-        "limit": str(limit),
-        "from": from_date,
-    }
-    if to_date:
-        params["to"] = to_date
+    if to_year is None:
+        to_year = datetime.now().year
 
-    for attempt in range(1, IA_MAX_RETRIES + 1):
-        try:
-            async with session.get(
-                IA_CDX_BASE,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=IA_TIMEOUT),
-            ) as resp:
-                if resp.status != 200:
-                    return []
-                rows = await resp.json(content_type=None)
-                if not rows or len(rows) < 2:
-                    return []
-                keys = rows[0]
-                return [dict(zip(keys, row)) for row in rows[1:]]
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            log.debug("CDX error for %s attempt %d: %s", url, attempt, exc)
-            if attempt < IA_MAX_RETRIES:
-                await asyncio.sleep(IA_RETRY_SLEEP * attempt)
-    return []
+    all_snapshots = []
+
+    for year in range(from_year, to_year + 1):
+        params = {
+            "output": "json",
+            "url": url,
+            "fl": "timestamp,original,statuscode,mimetype",
+            "filter": "statuscode:200",
+            "collapse": "timestamp:4",  # Collapse to year (YYYY)
+            "limit": "1",
+            "from": f"{year}0101",
+            "to": f"{year}1231",
+        }
+
+        for attempt in range(1, IA_MAX_RETRIES + 1):
+            try:
+                async with session.get(
+                        IA_CDX_BASE,
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=IA_TIMEOUT),
+                ) as resp:
+                    if resp.status != 200:
+                        break
+                    rows = await resp.json(content_type=None)
+                    if rows and len(rows) >= 2:
+                        keys = rows[0]
+                        snapshot = dict(zip(keys, rows[1]))
+                        all_snapshots.append(snapshot)
+                    break
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                log.debug("CDX error for %s year %d attempt %d: %s", url, year, attempt, exc)
+                if attempt < IA_MAX_RETRIES:
+                    await asyncio.sleep(IA_RETRY_SLEEP * attempt)
+
+    return all_snapshots
 
 
-def _parse_mods_from_json(data: dict, snapshot_url: str) -> list[ModEntry]:
+def _parse_mods_from_json(data: dict, snapshot_url: str, snapshot_ts: str) -> list[ModEntry]:
     """Extract mod entries from a /about/moderators.json snapshot."""
     mods = []
     children = data.get("data", {}).get("children", [])
     for child in children:
         entry = child if not child.get("data") else child["data"]
         if entry.get("name"):
-            mods.append(ModEntry.from_reddit_json(entry, source="ia_json"))
-            mods[-1].snapshot_url = snapshot_url
+            mods.append(ModEntry.from_reddit_json(entry, "ia_json", snapshot_url, snapshot_ts))
     return mods
 
 
-def _parse_mods_from_html(html: str, snapshot_url: str) -> list[ModEntry]:
+def _parse_mods_from_html(html: str, snapshot_url: str, snapshot_ts: str) -> list[ModEntry]:
     """
-    Lightweight regex-based extraction from old.reddit HTML pages.
-    Looks for mod username links in the sidebar or moderators page.
+    Extract moderator data from Reddit HTML pages.
+    Handles both old.reddit (table with <time> tags) and new Reddit (faceplate-date).
     """
     mods = []
-    # Pattern matches <a href="/user/USERNAME/...">USERNAME</a> in mod lists
-    patterns = [
-        r'class="[^"]*moderator[^"]*"[^>]*>\s*<a[^>]+href="/user/([^/"]+)',
-        r'<li[^>]*class="[^"]*even[^"]*"[^>]*>.*?/user/([^/"]+)',
-        r'/user/([^/"]+)/?\s*</a>\s*</li>',
-        r'"author":\s*"([^"]+)"',          # JSON-ish fragments in HTML
-    ]
     seen = set()
-    for pat in patterns:
-        for m in re.finditer(pat, html, re.IGNORECASE | re.DOTALL):
-            username = m.group(1).strip()
-            if username and username.lower() not in seen and username != "reddit":
-                seen.add(username.lower())
+
+    # Pattern 1: Old Reddit - <time datetime="..."> in table rows
+    old_reddit_pattern = r'<tr[^>]*>.*?/user/([^/"]+).*?<time[^>]+datetime="([^"]+)".*?</tr>'
+
+    for match in re.finditer(old_reddit_pattern, html, re.DOTALL | re.IGNORECASE):
+        username = match.group(1).strip()
+        datetime_str = match.group(2).strip()
+
+        if username and username.lower() not in seen and username.lower() != "reddit":
+            seen.add(username.lower())
+            try:
+                # Parse ISO-8601 datetime
+                dt = datetime.fromisoformat(datetime_str.replace('+00:00', '+00:00'))
+                added_utc = int(dt.timestamp())
+
+                mods.append(ModEntry(
+                    username=username,
+                    added_utc=added_utc,
+                    added_date=datetime_str,
+                    source="ia_html_old",
+                    snapshot_url=snapshot_url,
+                    snapshot_timestamp=snapshot_ts,
+                ))
+            except (ValueError, AttributeError) as e:
+                log.debug(f"Failed to parse datetime for {username}: {datetime_str} - {e}")
+                # Fall back to entry without date
                 mods.append(ModEntry(
                     username=username,
                     added_utc=None,
                     added_date=None,
-                    source="ia_html",
+                    source="ia_html_old",
                     snapshot_url=snapshot_url,
+                    snapshot_timestamp=snapshot_ts,
                 ))
+
+    # Pattern 2: New Reddit - <faceplate-date ts="..."> with nearby username
+    # Look for blocks containing both username and faceplate-date
+    new_reddit_pattern = r'<div[^>]+class="[^"]*tablerow[^"]*"[^>]*>.*?/user/([^/"]+).*?<faceplate-date[^>]+ts="([^"]+)".*?</div>'
+
+    for match in re.finditer(new_reddit_pattern, html, re.DOTALL | re.IGNORECASE):
+        username = match.group(1).strip()
+        ts_str = match.group(2).strip()
+
+        if username and username.lower() not in seen and username.lower() != "reddit":
+            seen.add(username.lower())
+            try:
+                # Parse timestamp string - format: "2016-03-05T21:36:06.614000+0000"
+                # Handle the +0000 timezone format
+                ts_str_normalized = ts_str.replace('+0000', '+00:00')
+                dt = datetime.fromisoformat(ts_str_normalized)
+                added_utc = int(dt.timestamp())
+
+                mods.append(ModEntry(
+                    username=username,
+                    added_utc=added_utc,
+                    added_date=dt.isoformat(),
+                    source="ia_html_new",
+                    snapshot_url=snapshot_url,
+                    snapshot_timestamp=snapshot_ts,
+                ))
+            except (ValueError, AttributeError) as e:
+                log.debug(f"Failed to parse faceplate-date ts for {username}: {ts_str} - {e}")
+                # Fall back to entry without date
+                mods.append(ModEntry(
+                    username=username,
+                    added_utc=None,
+                    added_date=None,
+                    source="ia_html_new",
+                    snapshot_url=snapshot_url,
+                    snapshot_timestamp=snapshot_ts,
+                ))
+
+    # Pattern 3: Fallback - just find usernames in moderator contexts (without dates)
+    if not mods:
+        fallback_patterns = [
+            r'class="[^"]*moderator[^"]*"[^>]*>\s*<a[^>]+href="/user/([^/"]+)',
+            r'/user/([^/"]+)[^>]*"[^>]*>u/\1',  # Match u/username links
+        ]
+
+        for pat in fallback_patterns:
+            for m in re.finditer(pat, html, re.IGNORECASE | re.DOTALL):
+                username = m.group(1).strip()
+                if username and username.lower() not in seen and username.lower() != "reddit":
+                    seen.add(username.lower())
+                    mods.append(ModEntry(
+                        username=username,
+                        added_utc=None,
+                        added_date=None,
+                        source="ia_html_fallback",
+                        snapshot_url=snapshot_url,
+                        snapshot_timestamp=snapshot_ts,
+                    ))
+
     return mods
 
-
 async def fetch_ia_snapshot(
-    session: aiohttp.ClientSession,
-    snapshot: dict,
-    semaphore: asyncio.Semaphore,
+        session: aiohttp.ClientSession,
+        snapshot: dict,
+        semaphore: asyncio.Semaphore,
+        raw_dir: Path,
+        subreddit: str,
 ) -> list[ModEntry]:
-    """Fetch one IA snapshot and extract moderator data from it."""
+    """Fetch one IA snapshot, save raw response, and extract moderator data."""
     ts = snapshot["timestamp"]
     original = snapshot["original"]
     wayback_url = f"{IA_WAYBACK_BASE}/{ts}id_/{original}"
@@ -223,22 +334,30 @@ async def fetch_ia_snapshot(
         for attempt in range(1, IA_MAX_RETRIES + 1):
             try:
                 async with session.get(
-                    wayback_url,
-                    timeout=aiohttp.ClientTimeout(total=IA_TIMEOUT),
-                    allow_redirects=True,
+                        wayback_url,
+                        timeout=aiohttp.ClientTimeout(total=IA_TIMEOUT),
+                        allow_redirects=True,
                 ) as resp:
                     if resp.status != 200:
                         return []
+
+                    # Save raw response
+                    content = await resp.read()
+                    ext = "json" if is_json else "html"
+                    raw_file = raw_dir / f"{subreddit}_{ts}.{ext}"
+                    raw_file.write_bytes(content)
+
+                    # Parse content
                     if is_json:
                         try:
-                            data = await resp.json(content_type=None)
-                            return _parse_mods_from_json(data, wayback_url)
+                            data = json.loads(content)
+                            return _parse_mods_from_json(data, wayback_url, ts)
                         except Exception:
-                            text = await resp.text(errors="replace")
-                            return _parse_mods_from_html(text, wayback_url)
+                            text = content.decode('utf-8', errors='replace')
+                            return _parse_mods_from_html(text, wayback_url, ts)
                     else:
-                        text = await resp.text(errors="replace")
-                        return _parse_mods_from_html(text, wayback_url)
+                        text = content.decode('utf-8', errors='replace')
+                        return _parse_mods_from_html(text, wayback_url, ts)
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 log.debug("IA fetch error %s attempt %d: %s", wayback_url, attempt, exc)
@@ -248,53 +367,71 @@ async def fetch_ia_snapshot(
 
 
 async def fetch_ia_mods(
-    session: aiohttp.ClientSession,
-    subreddit: str,
-    semaphore: asyncio.Semaphore,
-    snapshots_per_url: int = 20,
-) -> list[ModEntry]:
+        session: aiohttp.ClientSession,
+        subreddit_info: SubredditInfo,
+        semaphore: asyncio.Semaphore,
+        raw_dir: Path,
+) -> tuple[list[ModEntry], bool]:
     """
-    For each URL template, fetch CDX snapshots in parallel, then
-    fetch all those snapshots concurrently (bounded by semaphore).
+    Fetch IA snapshots one year at a time, stopping early if we find
+    a moderator within 7 days of subreddit creation.
+    Returns (mods, stopped_early).
     """
-    urls = [tpl.format(sub=subreddit) for tpl in IA_URL_TEMPLATES]
+    urls = [tpl.format(sub=subreddit_info.name) for tpl in IA_URL_TEMPLATES]
 
-    # Step 1: CDX lookups (parallel, IA CDX is lightweight)
+    # Determine year range
+    from_year = datetime.fromtimestamp(subreddit_info.creation_date, tz=timezone.utc).year
+    to_year = datetime.now().year
+
+    all_mods: list[ModEntry] = []
+
+    # Step 1: Get snapshots by year for all URLs
     cdx_tasks = [
-        ia_cdx_snapshots(session, url, limit=snapshots_per_url)
+        ia_cdx_snapshots_by_year(session, url, from_year, to_year)
         for url in urls
     ]
     cdx_results = await asyncio.gather(*cdx_tasks, return_exceptions=True)
 
-    # Flatten, deduplicate by timestamp+url
+    # Flatten and sort by timestamp (oldest first)
     all_snapshots: list[dict] = []
-    seen_ts_url: set[tuple] = set()
     for result in cdx_results:
         if isinstance(result, list):
-            for snap in result:
-                key = (snap["timestamp"], snap["original"])
-                if key not in seen_ts_url:
-                    seen_ts_url.add(key)
-                    all_snapshots.append(snap)
+            all_snapshots.extend(result)
 
-    if not all_snapshots:
-        return []
+    # Deduplicate by timestamp
+    seen_ts: set[str] = set()
+    unique_snapshots = []
+    for snap in sorted(all_snapshots, key=lambda x: x["timestamp"]):
+        if snap["timestamp"] not in seen_ts:
+            seen_ts.add(snap["timestamp"])
+            unique_snapshots.append(snap)
 
-    log.info("  r/%s – %d IA snapshots to fetch", subreddit, len(all_snapshots))
+    if not unique_snapshots:
+        return [], False
 
-    # Step 2: Fetch all snapshots concurrently (bounded by semaphore)
-    fetch_tasks = [
-        fetch_ia_snapshot(session, snap, semaphore)
-        for snap in all_snapshots
-    ]
-    snapshot_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+    log.info("  r/%s – %d IA snapshots to fetch", subreddit_info.name, len(unique_snapshots))
 
-    all_mods: list[ModEntry] = []
-    for r in snapshot_results:
-        if isinstance(r, list):
-            all_mods.extend(r)
+    # Step 2: Fetch snapshots one at a time (in chronological order) with early stopping
+    for snap in unique_snapshots:
+        mods = await fetch_ia_snapshot(session, snap, semaphore, raw_dir, subreddit_info.name)
 
-    return all_mods
+        if mods:
+            all_mods.extend(mods)
+
+            # Check for early stop condition
+            for mod in mods:
+                if mod.added_utc:
+                    if mod.added_utc <= subreddit_info.creation_date:
+                        log.info(f"  r/{subreddit_info.name} – Early stop: {mod.username} added at/before creation")
+                        return all_mods, True
+
+                    days_diff = (mod.added_utc - subreddit_info.creation_date) / (24 * 60 * 60)
+                    if days_diff <= 7:
+                        log.info(
+                            f"  r/{subreddit_info.name} – Early stop: {mod.username} added {days_diff:.1f} days after creation")
+                        return all_mods, True
+
+    return all_mods, False
 
 
 # ---------------------------------------------------------------------------
@@ -302,24 +439,34 @@ async def fetch_ia_mods(
 # ---------------------------------------------------------------------------
 
 async def process_subreddit(
-    subreddit: str,
-    session: aiohttp.ClientSession,
-    semaphore: asyncio.Semaphore,
+        subreddit_info: SubredditInfo,
+        session: aiohttp.ClientSession,
+        semaphore: asyncio.Semaphore,
+        raw_dir: Path,
 ) -> SubredditResult:
-    result = SubredditResult(subreddit=subreddit)
-    sub = subreddit.lstrip("r/").strip()
+    result = SubredditResult(
+        subreddit=subreddit_info.name,
+        creation_date=subreddit_info.creation_date
+    )
 
-    # --- Internet Archive fetch (parallelized) ---
+    # Create raw data subdirectory for this subreddit
+    sub_raw_dir = raw_dir / subreddit_info.name
+    sub_raw_dir.mkdir(parents=True, exist_ok=True)
+
     try:
-        ia_mods = await fetch_ia_mods(session, sub, semaphore)
-        log.info("r/%s – %d mod records from IA", sub, len(ia_mods))
+        ia_mods, stopped_early = await fetch_ia_mods(session, subreddit_info, semaphore, sub_raw_dir)
+        log.info("r/%s – %d mod records from IA", subreddit_info.name, len(ia_mods))
         result.merge(ia_mods)
+
+        if stopped_early:
+            result.check_early_stop()
+
     except Exception as exc:
         msg = f"IA fetch failed: {exc}"
-        log.warning("r/%s – %s", sub, msg)
+        log.warning("r/%s – %s", subreddit_info.name, msg)
         result.errors.append(msg)
 
-    log.info("r/%s – final: %d unique moderators", sub, len(result.moderators))
+    log.info("r/%s – final: %d unique moderators", subreddit_info.name, len(result.moderators))
     return result
 
 
@@ -327,21 +474,24 @@ async def process_subreddit(
 # Entry point
 # ---------------------------------------------------------------------------
 
-async def main(subreddits: list[str], output_path: Optional[str], concurrency: int):
+async def main(subreddits: list[SubredditInfo], output_path: Optional[str], concurrency: int):
     ia_semaphore = asyncio.Semaphore(IA_CONCURRENCY)
 
+    # Create raw data directory
+    raw_dir = Path("raw_responses")
+    raw_dir.mkdir(exist_ok=True)
+
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    ia_connector = aiohttp.TCPConnector(limit=32)  # IA: can handle more
+    ia_connector = aiohttp.TCPConnector(limit=32)
 
     async with aiohttp.ClientSession(headers=headers, connector=ia_connector) as session:
-        # Process subreddits with a concurrency cap to avoid thundering herd
         sub_semaphore = asyncio.Semaphore(concurrency)
 
-        async def bounded(sub):
+        async def bounded(sub_info):
             async with sub_semaphore:
-                return await process_subreddit(sub, session, ia_semaphore)
+                return await process_subreddit(sub_info, session, ia_semaphore, raw_dir)
 
-        tasks = [bounded(sub) for sub in subreddits]
+        tasks = [bounded(sub_info) for sub_info in subreddits]
         results: list[SubredditResult] = []
 
         for coro in tqdm.as_completed(tasks, total=len(tasks), desc="Subreddits"):
@@ -357,8 +507,6 @@ async def main(subreddits: list[str], output_path: Optional[str], concurrency: i
     else:
         print(json_str)
 
-
-# ... existing code ...
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -390,29 +538,30 @@ if __name__ == "__main__":
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Read subreddits from subreddits.txt
-    subreddit_file = Path("subreddits.txt")
-    if not subreddit_file.exists():
-        print("Error: subreddits.txt not found.", file=sys.stderr)
+    # Read subreddits from subredditData.csv
+    csv_file = Path("subredditData.csv")
+    if not csv_file.exists():
+        print("Error: subredditData.csv not found.", file=sys.stderr)
         sys.exit(1)
 
-    lines = subreddit_file.read_text().splitlines()
-    subreddits = [l.strip().lstrip("r/") for l in lines if l.strip() and not l.startswith("#")]
+    subreddits = []
+    with open(csv_file, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                subreddits.append(SubredditInfo(
+                    name=row['subreddit_name'].strip(),
+                    creation_date=int(row['subreddit_creation_date']),
+                    earliest_post=int(row['earliest_post']),
+                    earliest_comment=int(row['earliest_comment']),
+                ))
+            except (KeyError, ValueError) as e:
+                log.warning(f"Skipping invalid row: {row} - {e}")
+                continue
 
     if not subreddits:
-        print("Error: subreddits.txt is empty or contains no valid subreddit names.", file=sys.stderr)
+        print("Error: subredditData.csv contains no valid subreddit data.", file=sys.stderr)
         sys.exit(1)
 
-    # Deduplicate, preserve order
-    seen = set()
-    unique_subs = []
-    for s in subreddits:
-        k = s.lower()
-        if k not in seen:
-            seen.add(k)
-            unique_subs.append(s)
-
-    log.info("Processing %d subreddit(s)…", len(unique_subs))
-    asyncio.run(main(unique_subs, args.output, args.concurrency))
-
-
+    log.info("Processing %d subreddit(s)…", len(subreddits))
+    asyncio.run(main(subreddits, args.output, args.concurrency))
