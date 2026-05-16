@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +43,14 @@ IA_CONCURRENCY = 8
 IA_TIMEOUT = 30
 IA_MAX_RETRIES = 3
 IA_RETRY_SLEEP = 2.0
+
+# Rate limiting: 1 request per second globally
+RATE_LIMIT_DELAY = 1.0  # seconds between requests
+
+# Backoff settings for rate limits and Cloudflare blocks
+RATE_LIMIT_BACKOFF = 60  # Initial backoff when rate limited (seconds)
+CLOUDFLARE_BACKOFF = 300  # Initial backoff for Cloudflare blocks (5 minutes)
+MAX_BACKOFF = 3600  # Maximum backoff time (1 hour)
 
 USER_AGENT = os.getenv("USER_AGENT")
 if not USER_AGENT:
@@ -69,6 +78,52 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Rate Limiter with Backoff Support
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """
+    Global rate limiter with support for temporary pauses due to rate limits
+    or Cloudflare blocks.
+    """
+
+    def __init__(self, delay: float = 1.0):
+        self.delay = delay
+        self.last_request_time = 0.0
+        self.lock = asyncio.Lock()
+        self.paused_until = 0.0
+        self.pause_lock = asyncio.Lock()
+
+    async def acquire(self):
+        """Wait until we're allowed to make another request."""
+        async with self.lock:
+            # Check if we're in a pause period
+            now = time.time()
+            if now < self.paused_until:
+                wait_time = self.paused_until - now
+                log.warning(f"⏸️  Rate limiter paused, waiting {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time)
+
+            # Normal rate limiting
+            now = time.time()
+            time_since_last = now - self.last_request_time
+
+            if time_since_last < self.delay:
+                wait_time = self.delay - time_since_last
+                await asyncio.sleep(wait_time)
+
+            self.last_request_time = time.time()
+
+    async def pause(self, duration: float):
+        """Pause all requests for the specified duration."""
+        async with self.pause_lock:
+            pause_until = time.time() + duration
+            if pause_until > self.paused_until:
+                self.paused_until = pause_until
+                log.warning(f"⏸️  Pausing all requests for {duration:.1f} seconds")
 
 
 # ---------------------------------------------------------------------------
@@ -164,10 +219,6 @@ class SubredditResult:
 # Progress tracking
 # ---------------------------------------------------------------------------
 
-import re
-
-
-# Add this function near the top of the file, after imports
 def sanitize_filename(name: str) -> str:
     """
     Sanitize a string to be safe for use as a filename/directory name.
@@ -187,9 +238,11 @@ def sanitize_filename(name: str) -> str:
         sanitized = 'unnamed'
 
     return sanitized
+
+
 def save_progress(subreddit: str, result: SubredditResult, processed_snapshots: set[str]):
     """Save intermediate progress for a subreddit."""
-    progress_file = PROGRESS_DIR / f"{subreddit}.json"
+    progress_file = PROGRESS_DIR / f"{sanitize_filename(subreddit)}.json"
 
     progress_data = {
         "result": result.to_dict(),
@@ -203,7 +256,7 @@ def save_progress(subreddit: str, result: SubredditResult, processed_snapshots: 
 
 def load_progress(subreddit: str) -> tuple[Optional[SubredditResult], set[str]]:
     """Load progress for a subreddit if it exists."""
-    progress_file = PROGRESS_DIR / f"{subreddit}.json"
+    progress_file = PROGRESS_DIR / f"{sanitize_filename(subreddit)}.json"
 
     if not progress_file.exists():
         return None, set()
@@ -237,7 +290,7 @@ def load_progress(subreddit: str) -> tuple[Optional[SubredditResult], set[str]]:
 
 def is_completed(subreddit: str) -> bool:
     """Check if a subreddit has been fully processed."""
-    result_file = RESULTS_DIR / f"{subreddit}.json"
+    result_file = RESULTS_DIR / f"{sanitize_filename(subreddit)}.json"
     return result_file.exists()
 
 
@@ -261,6 +314,7 @@ def save_final_result(result: SubredditResult):
 async def ia_cdx_snapshots_by_year(
         session: aiohttp.ClientSession,
         url: str,
+        rate_limiter: RateLimiter,
         from_year: int = 2005,
         to_year: Optional[int] = None,
 ) -> list[dict]:
@@ -283,15 +337,42 @@ async def ia_cdx_snapshots_by_year(
             "to": f"{year}1231",
         }
 
+        backoff_time = IA_RETRY_SLEEP
+
         for attempt in range(1, IA_MAX_RETRIES + 1):
             try:
+                await rate_limiter.acquire()
                 async with session.get(
                         IA_CDX_BASE,
                         params=params,
                         timeout=aiohttp.ClientTimeout(total=IA_TIMEOUT),
                 ) as resp:
+                    # Handle rate limiting
+                    if resp.status == 429:
+                        retry_after = float(resp.headers.get("Retry-After", RATE_LIMIT_BACKOFF))
+                        log.warning(f"⚠️  Rate limited (429) – pausing for {retry_after}s")
+                        await rate_limiter.pause(retry_after)
+                        continue
+
+                    # Handle Cloudflare blocks
+                    if resp.status in (403, 503):
+                        is_cloudflare = (
+                                'cloudflare' in resp.headers.get('Server', '').lower() or
+                                resp.status == 503
+                        )
+
+                        if is_cloudflare:
+                            backoff = min(CLOUDFLARE_BACKOFF * (2 ** (attempt - 1)), MAX_BACKOFF)
+                            log.warning(
+                                f"🛡️  Cloudflare block detected (HTTP {resp.status}) "
+                                f"– pausing for {backoff}s (attempt {attempt}/{IA_MAX_RETRIES})"
+                            )
+                            await rate_limiter.pause(backoff)
+                            continue
+
                     if resp.status != 200:
                         return None
+
                     rows = await resp.json(content_type=None)
                     if rows and len(rows) >= 2:
                         keys = rows[0]
@@ -300,7 +381,8 @@ async def ia_cdx_snapshots_by_year(
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 log.debug("CDX error for %s year %d attempt %d: %s", url, year, attempt, exc)
                 if attempt < IA_MAX_RETRIES:
-                    await asyncio.sleep(IA_RETRY_SLEEP * attempt)
+                    backoff_time = min(backoff_time * 2, MAX_BACKOFF)
+                    await asyncio.sleep(backoff_time)
         return None
 
     # Fetch all years in parallel
@@ -423,6 +505,7 @@ async def fetch_ia_snapshot(
         session: aiohttp.ClientSession,
         snapshot: dict,
         semaphore: asyncio.Semaphore,
+        rate_limiter: RateLimiter,
         raw_dir: Path,
         subreddit: str,
 ) -> list[ModEntry]:
@@ -453,14 +536,40 @@ async def fetch_ia_snapshot(
             return _parse_mods_from_html(text, wayback_url, ts)
 
     # Fetch new snapshot
+    backoff_time = IA_RETRY_SLEEP
+
     async with semaphore:
         for attempt in range(1, IA_MAX_RETRIES + 1):
             try:
+                await rate_limiter.acquire()
                 async with session.get(
                         wayback_url,
                         timeout=aiohttp.ClientTimeout(total=IA_TIMEOUT),
                         allow_redirects=True,
                 ) as resp:
+                    # Handle rate limiting
+                    if resp.status == 429:
+                        retry_after = float(resp.headers.get("Retry-After", RATE_LIMIT_BACKOFF))
+                        log.warning(f"⚠️  Rate limited (429) – pausing for {retry_after}s")
+                        await rate_limiter.pause(retry_after)
+                        continue
+
+                    # Handle Cloudflare blocks
+                    if resp.status in (403, 503):
+                        is_cloudflare = (
+                                'cloudflare' in resp.headers.get('Server', '').lower() or
+                                resp.status == 503
+                        )
+
+                        if is_cloudflare:
+                            backoff = min(CLOUDFLARE_BACKOFF * (2 ** (attempt - 1)), MAX_BACKOFF)
+                            log.warning(
+                                f"🛡️  Cloudflare block detected (HTTP {resp.status}) "
+                                f"– pausing for {backoff}s (attempt {attempt}/{IA_MAX_RETRIES})"
+                            )
+                            await rate_limiter.pause(backoff)
+                            continue
+
                     if resp.status != 200:
                         log.debug(f"Snapshot {ts} returned status {resp.status}")
                         return []
@@ -484,7 +593,8 @@ async def fetch_ia_snapshot(
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 log.debug("IA fetch error %s attempt %d: %s", wayback_url, attempt, exc)
                 if attempt < IA_MAX_RETRIES:
-                    await asyncio.sleep(IA_RETRY_SLEEP * attempt)
+                    backoff_time = min(backoff_time * 2, MAX_BACKOFF)
+                    await asyncio.sleep(backoff_time)
     return []
 
 
@@ -492,6 +602,7 @@ async def fetch_ia_mods(
         session: aiohttp.ClientSession,
         subreddit_info: SubredditInfo,
         semaphore: asyncio.Semaphore,
+        rate_limiter: RateLimiter,
         raw_dir: Path,
         resume: bool = False,
 ) -> tuple[list[ModEntry], bool]:
@@ -530,7 +641,7 @@ async def fetch_ia_mods(
 
         # Fetch all CDX data in parallel
         cdx_tasks = [
-            ia_cdx_snapshots_by_year(session, url, from_year, to_year)
+            ia_cdx_snapshots_by_year(session, url, rate_limiter, from_year, to_year)
             for url in urls
         ]
         cdx_results = await asyncio.gather(*cdx_tasks, return_exceptions=True)
@@ -583,7 +694,7 @@ async def fetch_ia_mods(
             ts = snap["timestamp"]
 
             # Fetch and parse the snapshot
-            mods = await fetch_ia_snapshot(session, snap, semaphore, raw_dir, subreddit_info.name)
+            mods = await fetch_ia_snapshot(session, snap, semaphore, rate_limiter, raw_dir, subreddit_info.name)
 
             # Mark as processed
             processed_snapshots.add(ts)
@@ -646,6 +757,7 @@ async def process_subreddit(
         subreddit_info: SubredditInfo,
         session: aiohttp.ClientSession,
         semaphore: asyncio.Semaphore,
+        rate_limiter: RateLimiter,
         raw_dir: Path,
         resume: bool = False,
 ) -> SubredditResult:
@@ -660,12 +772,10 @@ async def process_subreddit(
         safe_name = sanitize_filename(subreddit_info.name)
         sub_raw_dir = raw_dir / safe_name
         sub_raw_dir.mkdir(parents=True, exist_ok=True)
-        # sub_raw_dir = raw_dir / subreddit_info.name
-        # sub_raw_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             ia_mods, stopped_early = await fetch_ia_mods(
-                session, subreddit_info, semaphore, sub_raw_dir, resume
+                session, subreddit_info, semaphore, rate_limiter, sub_raw_dir, resume
             )
             log.info("r/%s – %d mod records from IA", subreddit_info.name, len(ia_mods))
             result.moderators = ia_mods
@@ -716,6 +826,9 @@ async def main(subreddits: list[SubredditInfo], output_path: Optional[str], conc
     raw_dir = Path("raw_responses")
     raw_dir.mkdir(exist_ok=True)
 
+    # Global rate limiter: 1 request per second
+    rate_limiter = RateLimiter(delay=RATE_LIMIT_DELAY)
+
     ia_semaphore = asyncio.Semaphore(IA_CONCURRENCY)
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     ia_connector = aiohttp.TCPConnector(limit=32)
@@ -725,7 +838,7 @@ async def main(subreddits: list[SubredditInfo], output_path: Optional[str], conc
 
         async def bounded(sub_info):
             async with sub_semaphore:
-                return await process_subreddit(sub_info, session, ia_semaphore, raw_dir, resume)
+                return await process_subreddit(sub_info, session, ia_semaphore, rate_limiter, raw_dir, resume)
 
         tasks = [bounded(sub_info) for sub_info in subreddits]
         results: list[SubredditResult] = []
@@ -769,6 +882,7 @@ def parse_args():
     parser.add_argument(
         "--debug",
         action="store_true",
+        default=True,
         help="Enable debug logging",
     )
     return parser.parse_args()
